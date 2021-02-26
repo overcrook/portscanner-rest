@@ -1,10 +1,79 @@
+import functools
+import asyncio
 import inspect
 import json
 import portscan
+from portscan import POLLIN, POLLOUT
 from aiohttp import web
 
 DEFAULT_METHODS = ['GET']
-        
+
+def update_reader(fut, scan, callback, old_pollin, new_pollin):
+    if old_pollin == new_pollin:
+        return
+
+    loop = asyncio.get_running_loop()
+
+    if new_pollin:
+        loop.add_reader(scan.scan_fd, callback, fut, scan)
+    else:
+        loop.remove_reader(scan.scan_fd)
+
+def update_writer(fut, scan, callback, old_pollout, new_pollout):
+    if old_pollout == new_pollout:
+        return
+
+    loop = asyncio.get_running_loop()
+
+    if new_pollout:
+        loop.add_writer(scan.scan_fd, callback, fut, scan)
+    else:
+        loop.remove_writer(scan.scan_fd)
+
+
+def scan_async_process(fut, scan, callback):
+    # Сохраняем текущее состояние ожидаемых событий
+    old_events = scan.events
+
+    # Выполняем требуемую обработку
+    callback()
+
+    # Обрабатываем изменение битовой маски ожидаемых событий
+    if old_events != scan.events:
+        update_reader(fut, scan, scan_asyncread,  old_events & POLLIN,  scan.events & POLLIN)
+        update_writer(fut, scan, scan_asyncwrite, old_events & POLLOUT, scan.events & POLLOUT)
+
+    # Как только сканер перестает ожидать и POLLIN, и POLLOUT, работа завершена
+    if scan.events == 0:
+        loop = asyncio.get_running_loop()
+        loop.remove_reader(scan.timer_fd)
+        fut.set_result(scan.close())
+
+
+def scan_asyncread(fut, scan):
+    scan_async_process(fut, scan, scan.read)
+
+
+def scan_asyncwrite(fut, scan):
+    scan_async_process(fut, scan, scan.write)
+
+
+def scan_asynctimeout(fut, scan):
+    scan_async_process(fut, scan, scan.timeout)
+
+
+async def asyncscan(ipaddress, port_start, port_end):
+    scan = portscan.new(ipaddress, port_start, port_end)
+    loop = asyncio.get_running_loop()
+    fut  = loop.create_future()
+
+    loop.add_writer(scan.scan_fd,  scan_asyncwrite,   fut, scan)
+    loop.add_reader(scan.scan_fd,  scan_asyncread,    fut, scan)
+    loop.add_reader(scan.timer_fd, scan_asynctimeout, fut, scan)
+
+    return await fut
+
+
 class RestEndpoint:
     def __init__(self):
         self.methods = {}
@@ -40,7 +109,7 @@ class RangeScanRestEndpoint(RestEndpoint):
         self.resource = resource
 
     async def get(self, ipaddress, port_start, port_end) -> web.Response:
-        ret = portscan.scan(ipaddress, int(port_start), int(port_end))
+        ret = await asyncscan(ipaddress, int(port_start), int(port_end))
 
         body = self.resource.encode([
             {'port': item.port, 'state': item.status}
